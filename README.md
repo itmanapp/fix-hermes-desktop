@@ -4,25 +4,84 @@ Hermes Desktop（Electron）在 Linux 上**更新後打不開**的修復流程�
 
 ---
 
+## 兩種已知的更新後故障模式
+
+| 模式 | 症狀 | 元凶 |
+|------|------|------|
+| **A：沙箱權限** | 點圖示或 CLI 啟動都崩潰，log 有 `GPU process launch failed: error_code=1002` + FATAL | `chrome-sandbox` 失去 setuid root |
+| **B：捷徑 Exec 壞掉** | CLI 啟動**正常**，但點桌面圖示**靜默無反應**；手動執行 `.desktop` 的 Exec 會出現 `ModuleNotFoundError: No module named 'hermes_cli'` | Hermes **每次啟動都會重新生成** `.desktop`，且生成器把 venv python 的符號連結 resolve 成 uv 基礎 Python 寫進 Exec |
+
+先分辨模式再動手：
+
+```bash
+# CLI 能起來嗎？（能 = 模式 B；不能且見 GPU FATAL = 模式 A）
+timeout 30 ~/.hermes/hermes-agent/venv/bin/hermes desktop 2>&1 | grep -ciE "fatal"
+```
+
+---
+
 ## TL;DR（最快路徑）
 
 ```bash
-# 直接執行本 repo 的自動修復腳本
+# 直接執行本 repo 的自動修復腳本（會自動判斷模式 A / B）
 ./fix.sh
 ```
 
-手動等價指令：
+### 模式 A 手動等價指令
 
 ```bash
 pkexec chown root:root "$HOME/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/chrome-sandbox"
 pkexec chmod 4755       "$HOME/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/chrome-sandbox"
 ```
 
+### 模式 B 手動等價指令
+
+```bash
+G="$HOME/.hermes/hermes-agent/hermes_cli/linux_desktop_entry.py"
+
+# 1) 修補生成器：不要把 venv python 的 symlink resolve 掉（兩處）
+cp "$G" "$G.pre-fixbak"
+sed -i 's|Path(sys\.executable)\.resolve()|Path(sys.executable).absolute()|g' "$G"
+
+# 2) 用修補後的生成器重新產生 .desktop
+rm -f "$HOME/.local/share/applications/hermes.desktop"
+"$HOME/.hermes/hermes-agent/venv/bin/python" -c "
+from pathlib import Path
+from hermes_cli.linux_desktop_entry import install_desktop_entry
+install_desktop_entry(Path('$HOME/.hermes/hermes-agent'))"
+update-desktop-database "$HOME/.local/share/applications/"
+```
+
+> 注意：**只手動改 `.desktop` 的 Exec 沒用**——Hermes 每次啟動都會用生成器重寫它，一定要先修生成器本身。
+> Hermes 更新（git pull/重建 checkout）可能把生成器的 patch 蓋掉，屆時重跑 `./fix.sh` 即會自動重套。
+
 ---
 
 ## 給 AI 的快速判定清單
 
-若使用者說「Hermes 桌面版更新後打不開」，依序確認以下特徵，**全部符合即套用本流程**：
+若使用者說「Hermes 桌面版更新後打不開」，**先分模式，再對號入座**：
+
+**第一步：CLI 試啟動（分辨 A / B）**
+
+```bash
+timeout 30 ~/.hermes/hermes-agent/venv/bin/hermes desktop 2>&1 | grep -iE "fatal|modulenotfound"
+```
+
+- 有 `GPU process ... FATAL` → **模式 A**，看下表。
+- CLI 正常但使用者說點圖示沒反應 → **模式 B**，依序檢查：
+  ```bash
+  grep ^Exec= ~/.local/share/applications/hermes.desktop
+  # 壞的長相：第一個 token 是 <...uv...>/python3.11（基礎直譯器）→ 必壞
+  # 好的長相（三種皆可）：
+  #   Exec=<...>/venv/bin/hermes desktop
+  #   Exec=<...>/.local/bin/hermes desktop
+  #   Exec=<...>/venv/bin/python <repo>/hermes desktop
+  grep -c 'Path(sys.executable)\.resolve()' ~/.hermes/hermes-agent/hermes_cli/linux_desktop_entry.py
+  # >0 = 生成器仍會在下次啟動時重新寫壞 Exec，必須一併修補
+  ```
+  並手動執行該 Exec 字串驗證是否噴 `ModuleNotFoundError: No module named 'hermes_cli'`。
+
+### 模式 A 判定特徵
 
 | # | 檢查項 | 符合特徵 |
 |---|--------|----------|
@@ -46,6 +105,22 @@ pkexec chmod 4755       "$HOME/.hermes/hermes-agent/apps/desktop/release/linux-u
    > （見 `~/.hermes/hermes-agent/scripts/desktop-update/posix.sh` 的 `linux_gate()`）
 
 因此**每次更新都會復發**——這是設計上的必然，不是偶發 bug。
+
+### 模式 B 根因詳解
+
+1. venv 的 `bin/python` / `bin/python3` 是**符號連結**，指向 uv 管理的基礎 CPython
+   （`~/.local/share/uv/python/cpython-3.11.15-.../bin/python3.11`）。
+2. 生成器 `hermes_cli/linux_desktop_entry.py` 判斷啟動器是否需要直譯器前綴時，
+   用 `Path(sys.executable).resolve()` 取「目前直譯器目錄」與 shebang **字串**比對。
+   `.resolve()` 會追出 venv、落到 uv 基礎 Python 目錄 → 永遠比不中 venv shebang → 誤判。
+3. 誤判後它把前綴寫成 resolve() 後的**uv 基礎 Python**：
+   `Exec=<uv python> <venv>/bin/hermes desktop` → 基礎直譯器看不到 venv site-packages →
+   `ModuleNotFoundError: No module named 'hermes_cli'`，且 `.desktop` 是 `Terminal=false`，**靜默死亡**。
+4. `hermes desktop` 每次成功啟動都會呼叫 `install_desktop_entry()` 重寫 `.desktop`
+   （內容不同才寫），所以手動改 Exec 會在下一次啟動後被打回壞的版本。
+
+修法 = 把生成器兩處 `.resolve()` 改成 `.absolute()`（不追符號連結），再重新生成 entry；
+`fix.sh` 已內建此修補（Mode B(0)）並會在偵測到 patch 被 update 沖掉時自動重套。
 
 ---
 
